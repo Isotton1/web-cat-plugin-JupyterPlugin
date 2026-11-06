@@ -52,8 +52,18 @@ my $cfg          = Config::Properties::Simple->new(file => $propfile);
 
 my $pluginHome   = $cfg->getProperty('pluginHome');
 
-# Plugin-specific modules
-unshift(@INC, "$pluginHome/perllib");
+# Plugin-specific modules. In a regular Web-CAT installation $pluginHome is
+# the root of this repository (perllib lives in plugin/perllib); inside the
+# plugin container image, the contents of plugin/ are installed as
+# $pluginHome.
+for my $perllib ("$pluginHome/plugin/perllib", "$pluginHome/perllib")
+{
+    if (-d $perllib)
+    {
+        unshift(@INC, $perllib);
+        last;
+    }
+}
 require JupyterPlugin::Utilities;
 JupyterPlugin::Utilities->import;
 
@@ -105,12 +115,32 @@ my $debug                   = $cfg->getProperty('debug', 0);
 #-------------------------------------------------------
 my $studentNotebook  = "$resultDir/notebook.ipynb";
 my $student_src      = "$resultDir/notebook.py";
+# Copies of the student files that the code under test can read, even when
+# it runs as a different (unprivileged) user that cannot read $resultDir
 my $workNotebook     = "$workingDir/notebook.ipynb";
 my $workSrc          = "$workingDir/notebook.py";
+my $pythonLib        = "$pluginHome/student/pythonlib";
+my $basePythonPath;   # PYTHONPATH inherited from the environment, if any
 my $can_proceed      = 1;
 my $timeout_occurred = 0;
 my $score            = 0;
 my $python           = $cfg->getProperty('pythonCmd', 'python');
+my $execEngine       = $cfg->getProperty('executionEngine', 'docker');
+my $containerImage   = $cfg->getProperty('containerImage', 'ghcr.io/web-cat/python-runner:1.0.0');
+my $containerArgs    = $cfg->getProperty('containerArgs', '--network none --memory 1g --cpus 1.0 --pids-limit 100');
+
+# When this script is itself running inside the plugin container image
+# (ghcr.io/web-cat/web-cat-plugin-jupyterplugin), the reference tests are
+# executed natively in that container (no docker-in-docker), as the
+# unprivileged "student" user, through this launcher script.
+my $studentCodeLauncher = '/plugin/student_code';
+my $inPluginContainer   = -x $studentCodeLauncher;
+if ($inPluginContainer && $execEngine ne 'host')
+{
+    print "running inside the plugin container: using execution engine "
+        . "'host' instead of '$execEngine'\n" if $debug;
+    $execEngine = 'host';
+}
 
 
 #=============================================================================
@@ -152,10 +182,10 @@ print "working dir set to $workingDir\n" if $debug;
         $ENV{'PATH'} = $cmdPath . ':' . $ENV{'PATH'};
     }
 
-    # The student code script sets its own PYTHONPATH. Python run as the
-    # instructor (nbconvert) must not import modules from the working
-    # directory, which the student controls.
-    delete $ENV{'PYTHONPATH'};
+    # PYTHONPATH is only set for the instructor test run itself (see
+    # below). Other python processes (e.g., nbconvert) must not import
+    # modules from the working directory, which the student controls.
+    $basePythonPath = delete $ENV{'PYTHONPATH'};
     if ($debug)
     {
         print "PYTHON CMD   = $python\n",
@@ -245,7 +275,6 @@ if (1)
     print TESTS<<END;
 import sys
 import pythy
-import nose.tools
 $imports
 
 # =============================================================================
@@ -310,11 +339,44 @@ if ($isStaff)
 if ($can_proceed)
 {
     my $outfile = $resultDir . "/instr-out.txt";
-    my $cmdline = "$Web_CAT::Utilities::SHELL"
-        . "exec sudo -u student -T " . ($timeout + 5)
-        . " /plugin/student_code > \"$outfile\"  2>&1";
+    my $cmdline;
+
+    if ($execEngine eq 'docker' || $execEngine eq 'podman')
+    {
+        my $uid = $<;
+        my $gid = $( + 0;
+        my $userArg = ($uid && $gid) ? "--user $uid:$gid" : "";
+
+        $cmdline = "$Web_CAT::Utilities::SHELL"
+            . "$execEngine run --rm $containerArgs $userArg "
+            . "-v \"$workingDir:$workingDir:rw\" "
+            . "-v \"$resultDir:$resultDir:rw\" "
+            . "-v \"$pythonLib:/opt/webcat/pythonlib:ro\" "
+            . "-w \"$workingDir\" "
+            . "-e \"PYTHONPATH=$resultDir/pythonlib:/opt/webcat/pythonlib:.:src\" "
+            . "\"$containerImage\" "
+            . "python -m pythy.runner > \"$outfile\" 2>&1";
+    }
+    elsif ($inPluginContainer)
+    {
+        # The launcher sets up its own PYTHONPATH and python interpreter
+        $cmdline = "$Web_CAT::Utilities::SHELL"
+            . "exec sudo -u student -T " . ($timeout + 5)
+            . " $studentCodeLauncher > \"$outfile\" 2>&1";
+    }
+    else
+    {
+        $cmdline = "$Web_CAT::Utilities::SHELL"
+            . "$python -m pythy.runner > \"$outfile\"  2>&1";
+    }
 
     print "cmdline = ", $cmdline, "\n" if $debug;
+
+    local $ENV{'PYTHONPATH'} = "$resultDir/pythonlib:$pythonLib:"
+        . ((defined $basePythonPath && $basePythonPath ne '')
+            ? "$basePythonPath:" : '')
+        . '.:src';
+    print "PYTHONPATH   = $ENV{PYTHONPATH}\n" if $debug;
 
     # Exec program and collect output
     my ($exitcode, $timeout_status) =
@@ -432,9 +494,26 @@ $cfg->setProperty( 'numCodeMarkups', $numCodeMarkups );
 
 # Pretty-print student notebook
 {
-    my $cmdline = "$Web_CAT::Utilities::SHELL"
-        . "jupyter nbconvert --to html --template full "
-        . "\"$studentNotebook\" --output $resultDir/public/notebook.html";
+    my $cmdline;
+    if ($execEngine eq 'docker' || $execEngine eq 'podman')
+    {
+        my $uid = $<;
+        my $gid = $( + 0;
+        my $userArg = ($uid && $gid) ? "--user $uid:$gid" : "";
+        $cmdline = "$Web_CAT::Utilities::SHELL"
+            . "$execEngine run --rm $containerArgs $userArg "
+            . "-v \"$resultDir:$resultDir:rw\" "
+            . "-w \"$resultDir\" "
+            . "\"$containerImage\" "
+            . "jupyter nbconvert --to html --template full "
+            . "\"$studentNotebook\" --output \"$resultDir/public/notebook.html\"";
+    }
+    else
+    {
+        $cmdline = "$Web_CAT::Utilities::SHELL"
+            . "jupyter nbconvert --to html --template full "
+            . "\"$studentNotebook\" --output $resultDir/public/notebook.html";
+    }
     print $cmdline, "\n" if $debug;
     system($cmdline . " > $resultDir/nbconvert.log 2>&1");
     if (-f "$resultDir/public/notebook.html")

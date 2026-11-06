@@ -25,7 +25,7 @@ curl -fsSL -o /tmp/miniforge.sh \
 	"https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-$(uname -m).sh"
 bash /tmp/miniforge.sh -b -p /opt/conda
 rm /tmp/miniforge.sh
-/opt/conda/bin/conda create -y -n plugin python=3.8 nbconvert pillow
+/opt/conda/bin/conda create -y -n plugin python=3.12 nbconvert pillow
 /opt/conda/bin/conda clean -afy
 
 apt-get purge -y --auto-remove cpanminus curl git make
