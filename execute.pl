@@ -129,20 +129,6 @@ my $execEngine       = $cfg->getProperty('executionEngine', 'docker');
 my $containerImage   = $cfg->getProperty('containerImage', 'ghcr.io/web-cat/python-runner:1.0.0');
 my $containerArgs    = $cfg->getProperty('containerArgs', '--network none --memory 1g --cpus 1.0 --pids-limit 100');
 
-# When this script is itself running inside the plugin container image
-# (ghcr.io/web-cat/web-cat-plugin-jupyterplugin), the reference tests are
-# executed natively in that container (no docker-in-docker), as the
-# unprivileged "student" user, through this launcher script.
-my $studentCodeLauncher = '/plugin/student_code';
-my $inPluginContainer   = -x $studentCodeLauncher;
-if ($inPluginContainer && $execEngine ne 'host')
-{
-    print "running inside the plugin container: using execution engine "
-        . "'host' instead of '$execEngine'\n" if $debug;
-    $execEngine = 'host';
-}
-
-
 #=============================================================================
 # Script Startup
 #=============================================================================
@@ -357,12 +343,11 @@ if ($can_proceed)
             . "\"$containerImage\" "
             . "python -m pythy.runner > \"$outfile\" 2>&1";
     }
-    elsif ($inPluginContainer)
+    elsif ($execEngine eq 'host')
     {
-        # The launcher sets up its own PYTHONPATH and python interpreter
         $cmdline = "$Web_CAT::Utilities::SHELL"
             . "exec sudo -u student -T " . ($timeout + 5)
-            . " $studentCodeLauncher > \"$outfile\" 2>&1";
+            . " /plugin/student_code > \"$outfile\" 2>&1";
     }
     else
     {
